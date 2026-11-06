@@ -1,75 +1,89 @@
+"""
+KHAAN-SHIELD brain: the alert engine.
+
+Pure logic - no hardware, no I/O. Takes a Reading, returns the single most
+urgent alert allowed to fire right now, respecting per-source cooldowns
+while still permitting escalations (WARN -> CRITICAL -> HALT).
+
+This file NEVER changes between laptop and Raspberry Pi.
+"""
 from dataclasses import dataclass
+
 from . import config
-import time
+
+_SEVERITY = {"NORMAL": 0, "WARN": 1, "CRITICAL": 2, "HALT": 3}
 
 
 @dataclass
 class Alert:
-    level: str
-    source: str
+    level: str    # NORMAL | WARN | CRITICAL | HALT
+    source: str   # gas | proximity | fatigue | none
     message: str
-    action: str
 
 
 class AlertEngine:
-    def __init__(self):
-        self.last_alert = {}
+    def __init__(self, cooldown_ticks=None):
+        self.cooldown_ticks = (
+            config.COOLDOWN_TICKS if cooldown_ticks is None else cooldown_ticks
+        )
+        self._last_fired = {}   # source -> (tick, level)
+        self._tick = 0
 
-    def evaluate(self, a, b=None, c=None):
-        # Support both: evaluate(Reading) and evaluate(GasReading, ProximityReading, FatigueReading)
-        if b is None and c is None:
-            # single Reading object
-            gas_ppm = a.gas_ppm
-            rear = a.rear_distance
-            eyes = a.eye_closure
-        else:
-            gas_ppm = a.gas_ppm
-            rear = b.rear_distance
-            eyes = c.eye_closure
+    # ---- per-source level + message ----
+    def _gas_alert(self, ppm):
+        if ppm >= config.GAS_HALT_PPM:
+            return "HALT", f"CO {ppm:.1f} ppm - ventilate, stop work"
+        if ppm >= config.GAS_CRITICAL_PPM:
+            return "CRITICAL", f"CO {ppm:.1f} ppm - ventilate, inform supervisor"
+        if ppm >= config.GAS_WARN_PPM:
+            return "WARN", f"CO {ppm:.1f} ppm rising"
+        return None
 
-        alerts = []
+    def _proximity_alert(self, dist):
+        if dist <= config.PROX_HALT_M:
+            return "HALT", f"rear obstacle at {dist:.1f} m - STOP"
+        if dist <= config.PROX_CRITICAL_M:
+            return "CRITICAL", f"rear obstacle at {dist:.1f} m - slow down"
+        if dist <= config.PROX_WARN_M:
+            return "WARN", f"rear obstacle at {dist:.1f} m - slow down"
+        return None
 
-        if gas_ppm >= config.GAS_HALT:
-            alerts.append(Alert("HALT", "gas", f"CO {gas_ppm:.1f} ppm - ventilate, stop work", "in-cab + GSM + engine cut-off"))
-        elif gas_ppm >= config.GAS_CRITICAL:
-            alerts.append(Alert("CRITICAL", "gas", f"CO {gas_ppm:.1f} ppm - ventilate, inform supervisor", "in-cab buzzer + GSM SMS"))
-        elif gas_ppm >= config.GAS_WARN:
-            alerts.append(Alert("WARN", "gas", f"CO {gas_ppm:.1f} ppm rising", "in-cab buzzer"))
-        else:
-            alerts.append(Alert("NORMAL", "gas", "gas normal", "none"))
+    def _fatigue_alert(self, closure):
+        if closure >= config.FATIGUE_CRITICAL:
+            return "CRITICAL", f"eye-closure {closure:.2f} - pull over and rest"
+        if closure >= config.FATIGUE_WARN:
+            return "WARN", f"eye-closure {closure:.2f} - take micro-break"
+        return None
 
-        if rear <= config.PROX_HALT:
-            alerts.append(Alert("HALT", "proximity", f"rear obstacle at {rear:.1f} m - STOP", "in-cab + GSM + engine cut-off"))
-        elif rear <= config.PROX_CRITICAL:
-            alerts.append(Alert("CRITICAL", "proximity", f"rear obstacle at {rear:.1f} m - slow down", "in-cab buzzer + GSM"))
-        elif rear <= config.PROX_WARN:
-            alerts.append(Alert("WARN", "proximity", f"rear obstacle at {rear:.1f} m - slow down", "in-cab buzzer"))
-        else:
-            alerts.append(Alert("NORMAL", "proximity", f"rear clear ({rear:.1f} m)", "none"))
+    def evaluate(self, reading) -> Alert:
+        self._tick += 1
 
-        if eyes >= config.FATIGUE_CRITICAL:
-            alerts.append(Alert("CRITICAL", "fatigue", f"eye-closure {eyes:.2f} - pull over and rest", "in-cab buzzer + GSM SMS"))
-        elif eyes >= config.FATIGUE_WARN:
-            alerts.append(Alert("WARN", "fatigue", f"eye-closure {eyes:.2f} - take micro-break", "in-cab buzzer"))
-        else:
-            alerts.append(Alert("NORMAL", "fatigue", "driver alert", "none"))
+        candidates = []
+        for source, detector, value in (
+            ("gas", self._gas_alert, reading.gas_ppm),
+            ("proximity", self._proximity_alert, reading.rear_distance),
+            ("fatigue", self._fatigue_alert, reading.eye_closure),
+        ):
+            hit = detector(value)
+            if hit is not None:
+                candidates.append((hit[0], source, hit[1]))
 
-        best = alerts[0]
-        for a_alert in alerts[1:]:
-            if config.SEVERITY_RANK[a_alert.level] > config.SEVERITY_RANK[best.level]:
-                best = a_alert
-            elif config.SEVERITY_RANK[a_alert.level] == config.SEVERITY_RANK[best.level] and a_alert.level != "NORMAL":
-                if config.MODULE_PRIORITY[a_alert.source] > config.MODULE_PRIORITY[best.source]:
-                    best = a_alert
+        # Cooldown filter: suppress repeats, but always allow escalation
+        allowed = []
+        for level, source, message in candidates:
+            last = self._last_fired.get(source)
+            if last is not None:
+                last_tick, last_level = last
+                in_cooldown = (self._tick - last_tick) < self.cooldown_ticks
+                escalating = _SEVERITY[level] > _SEVERITY[last_level]
+                if in_cooldown and not escalating:
+                    continue
+            allowed.append((level, source, message))
 
-        now = time.time()
-        key = best.source
-        last = self.last_alert.get(key)
-        if last:
-            last_level, last_ts = last
-            if last_level == best.level and now - last_ts < config.COOLDOWN_SECONDS:
-                return Alert("NORMAL", "engine", "alert in cooldown", "none")
+        if not allowed:
+            return Alert("NORMAL", "none", "")
 
-        if best.level != "NORMAL":
-            self.last_alert[key] = (best.level, now)
-        return best
+        allowed.sort(key=lambda a: _SEVERITY[a[0]], reverse=True)
+        level, source, message = allowed[0]
+        self._last_fired[source] = (self._tick, level)
+        return Alert(level, source, message)

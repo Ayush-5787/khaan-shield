@@ -7,3 +7,5 @@ logs/
 *.jsonl
 .DS_Store
 .pytest_cache/
+token.txt
+sms_outbox.txt

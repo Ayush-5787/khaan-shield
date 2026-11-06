@@ -1,50 +1,54 @@
-"""Simulated shift demo for KHAAN-SHIELD with auto shift report."""
-import sys
-from pathlib import Path
+"""
+KHAAN-SHIELD main loop.
 
-from .alert_engine import AlertEngine
-from .sensors import simulated_shift
-from .alert_logger import AlertLogger
-from .notifier import Notifier
-from .report import ShiftReport
+Run from the project root (must use -m form):
+    python -m src.main
+"""
+import time
 
-# --- mirror all console output to logs/khaan.log for the live dashboard ---
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "khaan.log"
+from src.alert_engine import AlertEngine
+from src.alert_logger import log_event
+from src.notifier import Notifier, sound_report
+from src.report import print_report
+from src.sensors import get_sensors
 
-class _Tee:
-    """Send every print() to both the terminal and the log file."""
-    def __init__(self, path):
-        self._file = open(path, "a", encoding="utf-8")
-        self._stdout = sys.stdout
+SHIFT_TICKS = 30
+TICK_SECONDS = 1
 
-    def write(self, data):
-        self._stdout.write(data)
-        self._file.write(data)
-        self._file.flush()
 
-    def flush(self):
-        self._stdout.flush()
-        self._file.flush()
+def run_shift(ticks=SHIFT_TICKS):
+    sensors = get_sensors()
+    engine = AlertEngine()
+    notifier = Notifier(self_test=True)   # EDIT 1: audible self-test at startup
 
-sys.stdout = _Tee(LOG_FILE)
-# --------------------------------------------------------------------------
+    try:
+        for tick in range(1, ticks + 1):
+            reading = sensors.tick()
+            alert = engine.evaluate(reading)
 
-engine = AlertEngine()
-logger = AlertLogger()
-notifier = Notifier()
+            if alert.level != "NORMAL":
+                log_event(alert, reading)
+                notifier.dispatch(alert)
+                print(f"Tick {tick:02d}: {alert.level:8s} | {alert.source:9s} | {alert.message}")
+            else:
+                print(f"Tick {tick:02d}: NORMAL   | gas={reading.gas_ppm:5.0f}ppm "
+                      f"rear={reading.rear_distance:4.1f}m eyes={reading.eye_closure:4.2f}")
 
-print("=== KHAAN-SHIELD v0.1 - simulated shift ===")
-for i, reading in enumerate(simulated_shift(), start=1):
-    alert = engine.evaluate(reading)
-    notifier_output = notifier.dispatch(alert)
-    if alert.level != "NORMAL":
-        logger.log(alert)
-        print(f"[{i:02d}] gas={reading.gas_ppm:5.1f}ppm  rear={reading.rear_distance:4.1f}m  eyes={reading.eye_closure:0.2f}  ->  {alert.level:8s}  [{alert.source}] {alert.message}")
-        print("     >>>", notifier_output)
-    else:
-        print(f"[{i:02d}] gas={reading.gas_ppm:5.1f}ppm  rear={reading.rear_distance:4.1f}m  eyes={reading.eye_closure:0.2f}  ->  {alert.level:8s}  [{alert.source}] {alert.message}")
+            time.sleep(TICK_SECONDS)
+    finally:
+        # Release resources cleanly on exit (including Ctrl+C)
+        sensors.close()
+        try:
+            from src.sensors import ON_PI
+            if ON_PI:
+                import RPi.GPIO as GPIO
+                GPIO.cleanup()
+        except Exception:
+            pass
 
-print("\n")
-ShiftReport().summarize()
+    print_report()
+    sound_report()                        # EDIT 2: prove whether beeps reached the speaker
+
+
+if __name__ == "__main__":
+    run_shift()

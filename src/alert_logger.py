@@ -1,26 +1,25 @@
-import json, os, time
-from datetime import datetime
+"""
+KHAAN-SHIELD logger: appends every alert + reading snapshot to shift.log.jsonl.
+One JSON object per line - easy to replay, analyze, or feed to a dashboard.
+"""
+import json
+import os
+import time
 
-class AlertLogger:
-    def __init__(self, path="logs/alerts.jsonl"):
-        self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+LOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shift.log.jsonl"
+)
 
-    def log(self, alert):
-        record = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "epoch": round(time.time(), 3),
-            "level": alert.level,
-            "source": alert.source,
-            "message": alert.message,
-            "action": alert.action,
-        }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-        return record
 
-    def read_all(self):
-        if not os.path.exists(self.path):
-            return []
-        with open(self.path, "r", encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
+def log_event(alert, reading):
+    record = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "level": alert.level,
+        "source": alert.source,
+        "message": alert.message,
+        "gas_ppm": round(reading.gas_ppm, 1),
+        "rear_distance": round(reading.rear_distance, 2),
+        "eye_closure": round(reading.eye_closure, 2),
+    }
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")

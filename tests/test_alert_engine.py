@@ -1,91 +1,70 @@
-"""Unit tests for KHAAN-SHIELD alert arbitration logic."""
-import pytest
-from types import SimpleNamespace
-
-from src.alert_engine import AlertEngine
+"""Tests for the KHAAN-SHIELD alert engine (the brain)."""
 from src import config
+from src.alert_engine import AlertEngine
+from src.sensors import Reading
 
 
-@pytest.fixture
-def engine():
-    return AlertEngine()
+def quiet():
+    return Reading(gas_ppm=50, rear_distance=4.0, eye_closure=0.05)
 
 
-def reading(gas, rear, eyes):
-    """Build a sensor-reading object the engine understands."""
-    return SimpleNamespace(gas_ppm=gas, rear_distance=rear, eye_closure=eyes)
+def test_normal_when_all_quiet():
+    assert AlertEngine().evaluate(quiet()).level == "NORMAL"
 
 
-# ---------- NORMAL ----------
-
-def test_normal_readings_stay_normal(engine):
-    result = engine.evaluate(reading(gas=10, rear=100, eyes=0.05))
-    assert result.level == "NORMAL"
-
-
-# ---------- GAS ----------
-
-def test_gas_spike_triggers_critical(engine):
-    gas = config.GAS_CRITICAL + (config.GAS_HALT - config.GAS_CRITICAL) / 2
-    result = engine.evaluate(reading(gas=gas, rear=100, eyes=0.05))
-    assert result.level == "CRITICAL"
-    assert result.source == "gas"
+def test_gas_warn():
+    r = Reading(gas_ppm=config.GAS_WARN_PPM + 10, rear_distance=4.0, eye_closure=0.0)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("WARN", "gas")
 
 
-def test_extreme_gas_triggers_halt(engine):
-    result = engine.evaluate(reading(gas=config.GAS_HALT + 10, rear=100, eyes=0.05))
-    assert result.level == "HALT"
-    assert result.source == "gas"
+def test_gas_critical():
+    r = Reading(gas_ppm=config.GAS_CRITICAL_PPM + 10, rear_distance=4.0, eye_closure=0.0)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("CRITICAL", "gas")
 
 
-# ---------- PROXIMITY ----------
-
-def test_close_proximity_triggers_critical(engine):
-    rear = config.PROX_CRITICAL - (config.PROX_CRITICAL - config.PROX_HALT) / 2
-    result = engine.evaluate(reading(gas=10, rear=rear, eyes=0.05))
-    assert result.level == "CRITICAL"
-    assert result.source == "proximity"
+def test_gas_halt():
+    r = Reading(gas_ppm=config.GAS_HALT_PPM + 10, rear_distance=4.0, eye_closure=0.0)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("HALT", "gas")
 
 
-def test_halt_cuts_engine(engine):
-    result = engine.evaluate(reading(gas=10, rear=config.PROX_HALT / 2, eyes=0.05))
-    assert result.level == "HALT"
-    assert "engine cut-off" in result.action
+def test_proximity_halt():
+    r = Reading(gas_ppm=50, rear_distance=config.PROX_HALT_M - 0.1, eye_closure=0.0)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("HALT", "proximity")
 
 
-# ---------- FATIGUE ----------
-
-def test_driver_fatigue_triggers_critical(engine):
-    eyes = config.FATIGUE_CRITICAL + 0.1
-    result = engine.evaluate(reading(gas=10, rear=100, eyes=eyes))
-    assert result.level == "CRITICAL"
-    assert result.source == "fatigue"
+def test_fatigue_warn():
+    r = Reading(gas_ppm=50, rear_distance=4.0, eye_closure=config.FATIGUE_WARN + 0.05)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("WARN", "fatigue")
 
 
-def test_fatigue_warn(engine):
-    eyes = config.FATIGUE_WARN + (config.FATIGUE_CRITICAL - config.FATIGUE_WARN) / 2
-    result = engine.evaluate(reading(gas=10, rear=100, eyes=eyes))
-    assert result.level == "WARN"
-    assert result.source == "fatigue"
+def test_fatigue_critical():
+    r = Reading(gas_ppm=50, rear_distance=4.0, eye_closure=config.FATIGUE_CRITICAL + 0.05)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("CRITICAL", "fatigue")
 
 
-# ---------- ARBITRATION ----------
-
-def test_worst_severity_wins(engine):
-    """Gas HALT + fatigue CRITICAL together must not downgrade."""
-    result = engine.evaluate(
-        reading(gas=config.GAS_HALT + 10, rear=100, eyes=config.FATIGUE_CRITICAL + 0.1)
-    )
-    assert result.level == "HALT"
-    assert result.source == "gas"
+def test_cooldown_suppresses_repeat():
+    engine = AlertEngine()
+    r = Reading(gas_ppm=config.GAS_HALT_PPM + 10, rear_distance=4.5, eye_closure=0.0)
+    assert engine.evaluate(r).level == "HALT"     # first: fires
+    assert engine.evaluate(r).level == "NORMAL"   # immediate repeat: suppressed
 
 
-# ---------- COOLDOWN ----------
+def test_cooldown_allows_escalation():
+    engine = AlertEngine()
+    warn = Reading(gas_ppm=config.GAS_WARN_PPM + 10, rear_distance=4.5, eye_closure=0.0)
+    halt = Reading(gas_ppm=config.GAS_HALT_PPM + 10, rear_distance=4.5, eye_closure=0.0)
+    assert engine.evaluate(warn).level == "WARN"
+    assert engine.evaluate(halt).level == "HALT"  # escalation bypasses cooldown
 
-def test_cooldown_suppresses_repeat_alerts(engine):
-    gas = config.GAS_HALT + 10
-    first = engine.evaluate(reading(gas=gas, rear=100, eyes=0.05))
-    assert first.source == "gas"
-    second = engine.evaluate(reading(gas=gas, rear=100, eyes=0.05))
-    assert second.level == "NORMAL"
-    assert second.message == "alert in cooldown"
+
+def test_highest_severity_wins():
+    r = Reading(gas_ppm=config.GAS_HALT_PPM + 10,
+                rear_distance=config.PROX_WARN_M - 0.1, eye_closure=0.0)
+    a = AlertEngine().evaluate(r)
+    assert (a.level, a.source) == ("HALT", "gas")
